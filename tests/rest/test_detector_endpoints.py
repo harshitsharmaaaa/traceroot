@@ -198,6 +198,17 @@ class TestListDetectorRuns:
         assert "(SELECT * FROM detector_runs FINAL) AS r" in count_sql
         assert "(SELECT * FROM detector_findings FINAL) AS f" in count_sql
 
+    def test_pagination_order_breaks_timestamp_ties_by_run_id(self, client, mock_ch, secret):
+        mock_ch.query.side_effect = [self._fake_data(), self._fake_count(1)]
+        resp = client.get(
+            "/api/v1/internal/detector-runs",
+            params={"project_id": "p1", "detector_id": "d1", "page": 1, "limit": 3},
+            headers={"X-Internal-Secret": secret},
+        )
+        assert resp.status_code == 200
+        data_query = " ".join(mock_ch.query.call_args_list[0].args[0].split())
+        assert "ORDER BY r.timestamp DESC, r.run_id DESC LIMIT" in data_query
+
 
 # =============================================================================
 # /traces/{trace_id}/detector-runs
