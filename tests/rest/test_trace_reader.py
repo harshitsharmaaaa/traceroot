@@ -669,3 +669,25 @@ class TestListTracesRows:
         page_query = " ".join(client.query.call_args_list[0].args[0].split())
         assert "ORDER BY trace_start_time DESC, trace_id DESC LIMIT" in page_query
         assert page_query.endswith("ORDER BY p.trace_start_time DESC, p.trace_id DESC")
+
+
+class TestPaginationTieBreakers:
+    def test_page_order_breaks_session_time_ties_by_session_id(self):
+        results = iter([_rows([]), _rows([[0]])])
+        service, client = _make_service(lambda *a, **kw: next(results))
+
+        service.list_sessions(project_id="p1", page=1, limit=3)
+
+        page_query = " ".join(client.query.call_args_list[0].args[0].split())
+        assert "ORDER BY max(t.trace_start_time) DESC, t.session_id DESC LIMIT" in page_query
+        assert page_query.endswith("ORDER BY last_trace_time DESC, td.session_id DESC")
+
+    def test_page_order_breaks_user_time_ties_by_user_id(self):
+        results = iter([_rows([]), _rows([[0]])])
+        service, client = _make_service(lambda *a, **kw: next(results))
+
+        service.list_users(project_id="p1", page=1, limit=3)
+
+        page_query = " ".join(client.query.call_args_list[0].args[0].split())
+        assert "ORDER BY last_trace_time DESC, user_id DESC LIMIT" in page_query
+        assert page_query.endswith("ORDER BY up.last_trace_time DESC, up.user_id DESC")
