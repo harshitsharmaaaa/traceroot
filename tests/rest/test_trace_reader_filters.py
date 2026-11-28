@@ -107,8 +107,12 @@ def _outer_where_clause(sql: str) -> str:
 
     The one line where every condition the translator produced is AND-joined together —
     the place where a loosely-bound operator in one condition would reach the others.
+    The latest-trace CTE has its own project-only WHERE before deduplication; skip that
+    relation and inspect the filter applied to the deduplicated rows.
     """
-    return next(line.strip() for line in sql.splitlines() if line.strip().startswith("WHERE t."))
+    lines = [line.strip() for line in sql.splitlines()]
+    relation = lines.index("FROM latest_traces AS t")
+    return next(line for line in lines[relation + 1 :] if line.startswith("WHERE t."))
 
 
 def _or_operators_outside_parentheses(clause: str) -> int:

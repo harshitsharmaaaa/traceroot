@@ -920,6 +920,60 @@ class TestListTracesRows:
         assert page_query.endswith("ORDER BY p.trace_start_time DESC, p.trace_id DESC")
 
 
+def _assert_trace_filter_follows_dedup(query: str, filter_sql: str) -> None:
+    """A list predicate must run against the latest trace version, not an old row."""
+    normalized = " ".join(query.split())
+    dedup = "ORDER BY t.ch_update_time DESC LIMIT 1 BY t.project_id, t.trace_id"
+    assert normalized.index(dedup) < normalized.index(filter_sql)
+
+
+def test_matching_trace_ids_filters_latest_trace_version_first():
+    results = iter([_rows([])])
+    service, client = _make_service(lambda *a, **kw: next(results))
+
+    service.matching_trace_ids(
+        [],
+        project_id="p1",
+        name="current-name",
+        user_id=None,
+        start_after=None,
+        end_before=None,
+        search_query=None,
+        filters=[],
+        include_evaluations=False,
+    )
+
+    _assert_trace_filter_follows_dedup(client.query.call_args.args[0], "t.name ILIKE {name:String}")
+
+
+def test_list_traces_filters_latest_trace_version_before_page_and_count():
+    results = iter([_rows([]), _rows([[0]])])
+    service, client = _make_service(lambda *a, **kw: next(results))
+
+    service.list_traces(project_id="p1", name="current-name")
+
+    _assert_trace_filter_follows_dedup(
+        client.query.call_args_list[0].args[0], "t.name ILIKE {name:String}"
+    )
+    _assert_trace_filter_follows_dedup(
+        client.query.call_args_list[1].args[0], "t.name ILIKE {name:String}"
+    )
+
+
+def test_list_sessions_filters_latest_trace_version_before_page_and_count():
+    results = iter([_rows([]), _rows([[0]])])
+    service, client = _make_service(lambda *a, **kw: next(results))
+
+    service.list_sessions(project_id="p1", search_query="current-session")
+
+    _assert_trace_filter_follows_dedup(
+        client.query.call_args_list[0].args[0], "t.session_id ILIKE {search_kw:String}"
+    )
+    _assert_trace_filter_follows_dedup(
+        client.query.call_args_list[1].args[0], "t.session_id ILIKE {search_kw:String}"
+    )
+
+
 @pytest.mark.parametrize(
     ("method_name", "page_order", "result_order"),
     [

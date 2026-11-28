@@ -208,6 +208,24 @@ def _evaluation_exclusion(params: dict) -> str:
     return f"t.trace_id NOT IN {_evaluation_trace_ids(start, end)}"
 
 
+def _latest_trace_rows(columns: str) -> str:
+    """Build a project-scoped relation containing only the latest trace version.
+
+    Trace metadata can be rewritten when a later span completes a trace. Filters must
+    be applied after this relation is collapsed: filtering the ReplacingMergeTree rows
+    first can return an older name, session, user, or start time that the current trace
+    no longer has. ``columns`` is assembled only from fixed call-site projections; it is
+    not caller input.
+    """
+    return f"""
+        SELECT {columns}
+        FROM traces AS t
+        WHERE t.project_id = {{project_id:String}}
+        ORDER BY t.ch_update_time DESC
+        LIMIT 1 BY t.project_id, t.trace_id
+    """
+
+
 def windowed_evaluation_exclusion(start_param: str, end_param: str) -> str:
     """SQL condition removing offline-evaluation traces from a window-bounded scan.
 
@@ -765,7 +783,14 @@ class TraceReaderService:
             customer_traffic_only("t"),
         )
         rows = self._client.query(
-            f"SELECT DISTINCT t.trace_id FROM traces AS t WHERE {where_clause}",
+            f"""
+            WITH latest_traces AS (
+                {_latest_trace_rows("t.trace_id, t.project_id, t.name, t.user_id, t.trace_start_time, t.session_id, t.metadata_map")}
+            )
+            SELECT DISTINCT t.trace_id
+            FROM latest_traces AS t
+            WHERE {where_clause}
+            """,
             parameters=params,
             settings=READ_QUERY_SETTINGS,
         ).result_rows
@@ -819,25 +844,16 @@ class TraceReaderService:
         # This avoids scanning/joining every span in the project on each list call,
         # and never groups by the large input/output text columns. See #963.
         query = f"""
-            WITH page AS (
-                -- Dedup ReplacingMergeTree by latest ch_update_time FIRST (correctness),
-                -- THEN order by start time for pagination.
+            WITH latest_traces AS (
+                {_latest_trace_rows("t.trace_id, t.project_id, t.name, t.trace_start_time, t.user_id, t.session_id, t.input, t.output, t.metadata_map")}
+            ),
+            page AS (
+                -- Filter only after deduplication, then order by start time for pagination.
                 SELECT
                     trace_id, project_id, name, trace_start_time,
                     user_id, session_id, input, output, metadata_map
-                FROM (
-                    -- metadata_map is the TRACE row's metadata, and it is what the list's
-                    -- single default-off Metadata cell renders. A metadata FILTER also
-                    -- matches span-level keys, so a matched row can still show a blank
-                    -- cell here; the span detail panel is the reconciliation point.
-                    SELECT
-                        t.trace_id, t.project_id, t.name, t.trace_start_time,
-                        t.user_id, t.session_id, t.input, t.output, t.metadata_map
-                    FROM traces AS t
-                    WHERE {where_clause}
-                    ORDER BY t.ch_update_time DESC
-                    LIMIT 1 BY t.project_id, t.trace_id
-                )
+                FROM latest_traces AS t
+                WHERE {where_clause}
                 -- trace_id breaks start-time ties (millisecond precision), so OFFSET
                 -- pages are disjoint and repeatable: no tied trace is skipped or
                 -- repeated across pages (#1747).
@@ -902,8 +918,11 @@ class TraceReaderService:
         # Get total count (count(DISTINCT) dedupes ReplacingMergeTree rows; no FINAL).
         # The evaluation exclusion rides in {where_clause} — shared with the page above.
         count_query = f"""
+            WITH latest_traces AS (
+                {_latest_trace_rows("t.trace_id, t.project_id, t.name, t.trace_start_time, t.user_id, t.session_id, t.metadata_map")}
+            )
             SELECT count(DISTINCT t.trace_id)
-            FROM traces AS t
+            FROM latest_traces AS t
             WHERE {where_clause}
         """
         count_result = self._client.query(
@@ -1297,15 +1316,13 @@ class TraceReaderService:
         # aggregate spans for only those trace_ids. Avoids the full traces x spans
         # FINAL join + group-by-on-text over the whole project on each call. See #963.
         query = f"""
-            WITH session_page AS (
+            WITH latest_traces AS (
+                {_latest_trace_rows("t.project_id, t.trace_id, t.session_id, t.trace_start_time, t.user_id, t.input, t.output")}
+            ),
+            session_page AS (
                 SELECT t.session_id
-                FROM (
-                    SELECT t.session_id, t.trace_start_time
-                    FROM traces AS t
-                    WHERE {where_clause}
-                    ORDER BY t.ch_update_time DESC
-                    LIMIT 1 BY t.project_id, t.trace_id
-                ) AS t
+                FROM latest_traces AS t
+                WHERE {where_clause}
                 GROUP BY t.session_id
                 ORDER BY max(t.trace_start_time) DESC, t.session_id DESC
                 LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}
@@ -1314,11 +1331,9 @@ class TraceReaderService:
                 SELECT
                     t.session_id, t.trace_id, t.trace_start_time, t.user_id,
                     t.input as trace_input, t.output as trace_output
-                FROM traces AS t
+                FROM latest_traces AS t
                 WHERE {where_clause}
                   AND t.session_id IN (SELECT session_id FROM session_page)
-                ORDER BY t.ch_update_time DESC
-                LIMIT 1 BY t.project_id, t.trace_id
             ),
             span_agg AS (
                 SELECT
@@ -1365,13 +1380,14 @@ class TraceReaderService:
         # Total distinct sessions. Dedup traces to their latest version first (via
         # LIMIT 1 BY) so a session_id changed across versions isn't double-counted.
         count_query = f"""
+            WITH latest_traces AS (
+                {_latest_trace_rows("t.project_id, t.trace_id, t.session_id, t.trace_start_time")}
+            )
             SELECT count(DISTINCT session_id)
             FROM (
                 SELECT t.session_id
-                FROM traces AS t
+                FROM latest_traces AS t
                 WHERE {where_clause}
-                ORDER BY t.ch_update_time DESC
-                LIMIT 1 BY t.project_id, t.trace_id
             )
         """
         count_result = self._client.query(count_query, parameters=params)
@@ -1408,15 +1424,15 @@ class TraceReaderService:
             # (scoped via the trace_id IN subquery so we never dedup the whole
             # project), then join + aggregate.
             span_io_query = f"""
-                WITH session_traces AS (
+                WITH latest_traces AS (
+                    {_latest_trace_rows("t.session_id, t.trace_id, t.project_id")}
+                ),
+                session_traces AS (
                     SELECT t.session_id, t.trace_id, t.project_id
-                    FROM traces AS t
-                    WHERE t.project_id = {{project_id:String}}
-                      AND {customer_traffic_only("t")}
+                    FROM latest_traces AS t
+                    WHERE {customer_traffic_only("t")}
                       AND t.session_id IN ({{session_ids:Array(String)}})
                       {f"AND {eval_exclusion}" if eval_exclusion else ""}
-                    ORDER BY t.ch_update_time DESC
-                    LIMIT 1 BY t.project_id, t.trace_id
                 ),
                 spans_dedup AS (
                     SELECT trace_id, project_id, input, output, span_start_time, span_end_time

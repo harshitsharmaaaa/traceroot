@@ -64,6 +64,10 @@ ALLOW_UNFILTERED_METHODS = {
     ("rest/services/trace_reader.py", "get_span_io"): (
         "per-span I/O keyed by trace_id + span_id; reached through a trace get_trace already scoped"
     ),
+    ("rest/services/trace_reader.py", "_latest_trace_rows"): (
+        "latest-version relation is narrowed to customer traffic by every caller after "
+        "deduplication, so filtering before this relation would reintroduce stale matches"
+    ),
 }
 
 SCAN = re.compile(r"FROM\s+(spans|traces)\b")
